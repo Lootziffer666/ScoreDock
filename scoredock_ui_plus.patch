@@ -1,0 +1,1274 @@
+--- a/ui/app.mjs
++++ b/ui/app.mjs
+@@ -1,18 +1,41 @@
+ import { ModeSwitch } from "./components/mode-switch.mjs";
++import { DensitySwitch } from "./components/density-switch.mjs";
++import { ToastHost } from "./components/toast-host.mjs";
++
++import { JobTable } from "./components/job-table.mjs";
++import { LogViewer } from "./components/log-viewer.mjs";
++import { PromoteWizard } from "./components/promote-wizard.mjs";
++
+ import { SuitePage } from "./pages/suite-page.mjs";
+ import { LabPage } from "./pages/lab-page.mjs";
+ 
+-customElements.define("mode-switch", ModeSwitch);
++function def(name, ctor){
++  if (!customElements.get(name)) customElements.define(name, ctor);
++}
++
++def("mode-switch", ModeSwitch);
++def("density-switch", DensitySwitch);
++def("toast-host", ToastHost);
++
++def("job-table", JobTable);
++def("log-viewer", LogViewer);
++def("promote-wizard", PromoteWizard);
++
++def("suite-page", SuitePage);
++def("lab-page", LabPage);
+ 
+ const routes = {
+-  "/suite": SuitePage,
+-  "/lab": LabPage,
++  "/suite": "suite-page",
++  "/lab": "lab-page",
+ };
+ 
+ function setActiveNav(routeKey){
+   document.querySelectorAll(".navlink").forEach(a => {
+     const r = a.getAttribute("href")?.replace("#","") || "";
+-    a.classList.toggle("active", r === routeKey);
++    const active = r === routeKey;
++    a.classList.toggle("active", active);
++    if (active) a.setAttribute("aria-current", "page");
++    else a.removeAttribute("aria-current");
+   });
+ }
+ 
+@@ -20,6 +43,13 @@
+   const h = window.location.hash || "#/suite";
+   const routeKey = h.replace("#","").split("?")[0];
+   return routeKey in routes ? routeKey : "/suite";
++}
++
++let currentPage = null;
++
++function applyDensity(){
++  const d = (localStorage.getItem("ui:density") || "comfortable").toLowerCase();
++  document.documentElement.classList.toggle("density-compact", d === "compact");
+ }
+ 
+ function render(){
+@@ -30,9 +60,37 @@
+   setActiveNav(routeKey);
+ 
+   app.replaceChildren();
+-  const Page = routes[routeKey];
+-  app.appendChild(new Page());
++  const tag = routes[routeKey];
++  currentPage = document.createElement(tag);
++  currentPage.dataset.route = routeKey;
++  app.appendChild(currentPage);
++
++  applyDensity();
+ }
++
++// Global shortcuts (route delegates to page)
++function isTypingTarget(target){
++  const el = target;
++  if (!el) return false;
++  if (el.closest?.("[contenteditable='true']")) return true;
++  const tag = (el.tagName || "").toLowerCase();
++  return tag === "input" || tag === "textarea" || tag === "select";
++}
++
++window.addEventListener("keydown", (e) => {
++  if (e.defaultPrevented) return;
++  if (e.ctrlKey || e.metaKey || e.altKey) return;
++  if (isTypingTarget(e.target)) return;
++
++  const key = String(e.key || "").toLowerCase();
++  if (!key) return;
++
++  const handler = currentPage?.handleShortcut;
++  if (typeof handler !== "function") return;
++
++  const handled = handler.call(currentPage, key, e);
++  if (handled) e.preventDefault();
++}, { passive: false });
+ 
+ window.addEventListener("hashchange", render);
+ render();
+--- /dev/null
++++ b/ui/components/density-switch.mjs
+@@ -0,0 +1,37 @@
++export class DensitySwitch extends HTMLElement {
++  connectedCallback(){
++    this.render();
++  }
++
++  _get(){
++    const v = (localStorage.getItem("ui:density") || "comfortable").toLowerCase();
++    return (v === "compact") ? "compact" : "comfortable";
++  }
++
++  _apply(mode){
++    const m = (mode === "compact") ? "compact" : "comfortable";
++    document.documentElement.classList.toggle("density-compact", m === "compact");
++    localStorage.setItem("ui:density", m);
++  }
++
++  render(){
++    const mode = this._get();
++    this._apply(mode);
++
++    this.innerHTML = `
++      <div class="row gap-8" role="group" aria-label="Density switch">
++        <span class="muted" style="font-size:12px;">Density</span>
++        <button class="btn ${mode === "comfortable" ? "primary" : ""}" data-density="comfortable" aria-pressed="${mode === "comfortable"}" title="Comfortable spacing">Comfort</button>
++        <button class="btn ${mode === "compact" ? "primary" : ""}" data-density="compact" aria-pressed="${mode === "compact"}" title="Compact spacing">Compact</button>
++      </div>
++    `;
++
++    this.querySelectorAll("button[data-density]").forEach(btn => {
++      btn.addEventListener("click", () => {
++        const m = btn.getAttribute("data-density") || "comfortable";
++        this._apply(m);
++        this.render();
++      });
++    });
++  }
++}
+--- a/ui/components/job-table.mjs
++++ b/ui/components/job-table.mjs
+@@ -1,36 +1,116 @@
+ export class JobTable extends HTMLElement {
+-  constructor({ jobs, selectedId, onSelect }){
++  constructor({ jobs, selectedId, onSelect, filters, onFilterChange, mode } = {}){
+     super();
+     this.jobs = jobs || [];
+     this.selectedId = selectedId || null;
+     this.onSelect = onSelect || (() => {});
++    this.filters = filters || { status: "", kind: "", q: "" };
++    this.onFilterChange = onFilterChange || (() => {});
++    this.mode = mode || "suite";
++
++    this._visibleIds = [];
+   }
+ 
+   connectedCallback(){
+     this.render();
+   }
+ 
++  setData({ jobs, selectedId, filters } = {}){
++    if (jobs) this.jobs = jobs;
++    if (selectedId !== undefined) this.selectedId = selectedId;
++    if (filters) this.filters = filters;
++    this.render();
++  }
++
++  getVisibleJobIds(){
++    return this._visibleIds.slice();
++  }
++
++  focusRow(id){
++    const safe = (window.CSS && CSS.escape) ? CSS.escape(String(id)) : String(id).replaceAll('"', '\\"');
++    const tr = this.querySelector(`tr[data-job="${safe}"]`);
++    tr?.focus();
++  }
++
+   render(){
+-    const rows = this.jobs
++    const allJobs = this.jobs || [];
++    const fStatus = String(this.filters?.status || "").trim();
++    const fKind = String(this.filters?.kind || "").trim();
++    const q = String(this.filters?.q || "").trim().toLowerCase();
++
++    const statuses = uniq(allJobs.map(j => String(j.status || "").trim()).filter(Boolean)).sort();
++    const kinds = uniq(allJobs.map(j => String(j.kind || "").trim()).filter(Boolean)).sort();
++
++    const filtered = allJobs
++      .filter(j => {
++        const s = String(j.status || "");
++        const k = String(j.kind || "");
++        const id = String(j.id || "");
++        if (fStatus && s !== fStatus) return false;
++        if (fKind && k !== fKind) return false;
++        if (q){
++          const hay = (id + " " + s + " " + k).toLowerCase();
++          if (!hay.includes(q)) return false;
++        }
++        return true;
++      })
+       .slice()
+-      .sort((a,b) => String(b.startedAt||"").localeCompare(String(a.startedAt||"")))
+-      .map(j => {
+-        const statusClass = j.status === "complete" ? "good" : (j.status === "failed" ? "bad" : "warn");
+-        const active = this.selectedId === j.id ? " style=\"outline:2px solid color-mix(in srgb, var(--accent) 45%, transparent);\"" : "";
+-        return `
+-          <tr ${active}>
+-            <td><a href="javascript:void(0)" data-job="${j.id}"><code>${j.id}</code></a></td>
+-            <td><span class="badge ${statusClass}">${j.status}</span></td>
+-            <td class="muted">${j.kind}</td>
+-            <td class="muted">${fmtTime(j.startedAt)}</td>
+-            <td class="muted">${j.endedAt ? fmtTime(j.endedAt) : "—"}</td>
+-            <td class="muted">${j.exitCode ?? "—"}</td>
+-          </tr>
+-        `;
+-      }).join("");
++      .sort((a,b) => String(b.startedAt||"").localeCompare(String(a.startedAt||"")));
++
++    this._visibleIds = filtered.map(j => String(j.id || ""));
++
++    const rows = filtered.map(j => {
++      const statusClass = j.status === "complete" ? "good" : (j.status === "failed" ? "bad" : "warn");
++      const selected = this.selectedId === j.id;
++      return `
++        <tr data-job="${escapeAttr(j.id)}" tabindex="0" aria-selected="${selected}">
++          <td class="jobid"><code>${escapeHtml(j.id)}</code></td>
++          <td><span class="badge ${statusClass}">${escapeHtml(j.status)}</span></td>
++          <td class="muted">${escapeHtml(j.kind)}</td>
++          <td class="muted">${fmtTime(j.startedAt)}</td>
++          <td class="muted">${j.endedAt ? fmtTime(j.endedAt) : "—"}</td>
++          <td class="muted">${escapeHtml(j.exitCode ?? "—")}</td>
++        </tr>
++      `;
++    }).join("");
++
++    const empty = this._renderEmpty(allJobs.length, filtered.length, { fStatus, fKind, q });
+ 
+     this.innerHTML = `
+-      <table class="table">
++      <div class="tablebar">
++        <div class="row gap-8 wrap">
++          <div class="field field-inline">
++            <div class="label">Status</div>
++            <select class="input select" data-filter="status" aria-label="Filter by status">
++              <option value="">All</option>
++              ${statuses.map(s => `<option value="${escapeAttr(s)}" ${s === fStatus ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
++            </select>
++          </div>
++
++          <div class="field field-inline">
++            <div class="label">Kind</div>
++            <select class="input select" data-filter="kind" aria-label="Filter by kind">
++              <option value="">All</option>
++              ${kinds.map(k => `<option value="${escapeAttr(k)}" ${k === fKind ? "selected" : ""}>${escapeHtml(k)}</option>`).join("")}
++            </select>
++          </div>
++
++          <div class="field field-inline" style="min-width:220px; flex:1;">
++            <div class="label">Search</div>
++            <input class="input" data-filter="q" value="${escapeHtml(this.filters?.q || "")}" placeholder="Job id, status, kind…" aria-label="Search jobs" />
++          </div>
++
++          <button class="btn" type="button" data-clear ${(!fStatus && !fKind && !q) ? "disabled" : ""}>Clear</button>
++        </div>
++
++        <div class="muted" style="font-size:12px; margin-top:6px;">
++          Showing <b>${filtered.length}</b> of <b>${allJobs.length}</b>
++          <span class="muted">•</span>
++          <span class="muted">Shortcuts: <span class="kbd">J</span>/<span class="kbd">K</span> navigate, <span class="kbd">Enter</span>/<span class="kbd">Space</span> select, <span class="kbd">F</span> focus logs</span>
++        </div>
++      </div>
++
++      <table class="table" role="grid" aria-label="Jobs">
+         <thead>
+           <tr>
+             <th>Job</th>
+@@ -42,15 +122,115 @@
+           </tr>
+         </thead>
+         <tbody>
+-          ${rows || `<tr><td colspan="6" class="muted">No jobs yet.</td></tr>`}
++          ${rows || empty}
+         </tbody>
+       </table>
+     `;
+ 
+-    this.querySelectorAll("[data-job]").forEach(a => {
+-      a.addEventListener("click", () => this.onSelect(a.getAttribute("data-job")));
+-    });
+-  }
++    this._wire();
++  }
++
++  _renderEmpty(allCount, visibleCount, { fStatus, fKind, q }){
++    if (allCount === 0){
++      if (this.mode === "lab"){
++        return `
++          <tr>
++            <td colspan="6">
++              <div class="empty">
++                <div class="empty-title">No jobs in Lab yet</div>
++                <div class="empty-body">
++                  Promote a verified run into <code>lab/_inbox</code>, then benchmark it.
++                  <div class="empty-steps">
++                    <div>1) <code>node scripts/generate_artifact.mjs --run private/runs/&lt;runbundle&gt;.json --out lab/_inbox</code></div>
++                    <div>2) <code>node scripts/run_benchmarks.mjs --artifact lab/_inbox/ART-XXXX.json --out lab/artifacts</code></div>
++                  </div>
++                </div>
++              </div>
++            </td>
++          </tr>
++        `;
++      }
++
++      return `
++        <tr>
++          <td colspan="6">
++            <div class="empty">
++              <div class="empty-title">No jobs yet</div>
++              <div class="empty-body">
++                Start your first run using <b>Start bench</b> (or <b>Start tweak</b>). Then select a row to view logs.
++                <div class="empty-steps">
++                  <div>1) Confirm your artifact is under <code>private/</code></div>
++                  <div>2) Click <b>Start bench</b></div>
++                  <div>3) Select the job to follow logs</div>
++                </div>
++              </div>
++            </div>
++          </td>
++        </tr>
++      `;
++    }
++
++    if (visibleCount === 0){
++      return `
++        <tr>
++          <td colspan="6">
++            <div class="empty">
++              <div class="empty-title">No matches</div>
++              <div class="empty-body">
++                No jobs match your filters.
++                ${(fStatus || fKind || q) ? `<div class="empty-steps"><div>Tip: click <b>Clear</b> to reset filters.</div></div>` : ``}
++              </div>
++            </div>
++          </td>
++        </tr>
++      `;
++    }
++
++    return `<tr><td colspan="6" class="muted">—</td></tr>`;
++  }
++
++  _wire(){
++    // Filters
++    this.querySelectorAll("[data-filter]").forEach(el => {
++      el.addEventListener("input", () => this._emitFilters());
++      el.addEventListener("change", () => this._emitFilters());
++    });
++
++    this.querySelector("[data-clear]")?.addEventListener("click", () => {
++      this.onFilterChange({ status: "", kind: "", q: "" });
++    });
++
++    const tbody = this.querySelector("tbody");
++    if (!tbody) return;
++
++    // Click / keyboard selection (event delegation)
++    tbody.addEventListener("click", (e) => {
++      const tr = e.target?.closest?.("tr[data-job]");
++      const id = tr?.getAttribute?.("data-job");
++      if (id) this.onSelect(id);
++    });
++
++    tbody.addEventListener("keydown", (e) => {
++      const tr = e.target?.closest?.("tr[data-job]");
++      if (!tr) return;
++      if (e.key === "Enter" || e.key === " "){
++        e.preventDefault();
++        const id = tr.getAttribute("data-job");
++        if (id) this.onSelect(id);
++      }
++    });
++  }
++
++  _emitFilters(){
++    const status = this.querySelector('[data-filter="status"]')?.value || "";
++    const kind = this.querySelector('[data-filter="kind"]')?.value || "";
++    const q = this.querySelector('[data-filter="q"]')?.value || "";
++    this.onFilterChange({ status, kind, q });
++  }
++}
++
++function uniq(arr){
++  return Array.from(new Set(arr));
+ }
+ 
+ function fmtTime(iso){
+@@ -62,3 +242,16 @@
+     return iso;
+   }
+ }
++
++function escapeHtml(s){
++  return String(s ?? "")
++    .replaceAll("&", "&amp;")
++    .replaceAll("<", "&lt;")
++    .replaceAll(">", "&gt;")
++    .replaceAll('"', "&quot;")
++    .replaceAll("'", "&#039;");
++}
++
++function escapeAttr(s){
++  return escapeHtml(s).replaceAll('"', "&quot;");
++}
+--- a/ui/components/log-viewer.mjs
++++ b/ui/components/log-viewer.mjs
+@@ -5,10 +5,14 @@
+     super();
+     this.jobId = jobId || null;
+     this._timer = null;
++
++    this.follow = true; // auto-scroll to bottom
++    this._lastTxt = "";
+   }
+ 
+   connectedCallback(){
+     this.render();
++    this._wire();
+     this.poll();
+     this._timer = window.setInterval(() => this.poll(), 1000);
+   }
+@@ -17,23 +21,69 @@
+     if (this._timer) window.clearInterval(this._timer);
+   }
+ 
++  _wire(){
++    const pre = this.querySelector("pre");
++    const followBtn = this.querySelector("[data-follow]");
++    if (followBtn){
++      followBtn.addEventListener("click", () => {
++        this.follow = !this.follow;
++        this._renderFollow();
++        if (this.follow && pre) pre.scrollTop = pre.scrollHeight;
++      });
++    }
++
++    // If user scrolls up, pause follow automatically.
++    pre?.addEventListener("scroll", () => {
++      const nearBottom = (pre.scrollHeight - pre.scrollTop - pre.clientHeight) < 40;
++      const next = nearBottom ? true : false;
++      if (this.follow !== next){
++        this.follow = next;
++        this._renderFollow();
++      }
++    }, { passive: true });
++  }
++
++  _renderFollow(){
++    const followBtn = this.querySelector("[data-follow]");
++    if (!followBtn) return;
++    followBtn.textContent = this.follow ? "Follow: On" : "Follow: Off";
++    followBtn.classList.toggle("primary", this.follow);
++  }
++
+   async poll(){
++    const pre = this.querySelector("pre");
++    const statusEl = this.querySelector("[data-status]");
++    if (!pre) return;
++
+     if (!this.jobId){
+-      this.querySelector("pre")?.replaceChildren(document.createTextNode("No job selected."));
++      if (statusEl) statusEl.textContent = "No job selected";
++      pre.textContent = "No job selected.";
++      this._lastTxt = pre.textContent;
+       return;
+     }
++
+     const data = await api.logs(this.jobId, { tail: 20000 }).catch(() => null);
+     if (!data) return;
++
++    if (statusEl) statusEl.textContent = `${data.status} • ${data.id}`;
++
+     const header = `[${data.status}] ${data.id}\n\n`;
+     const txt = header + (data.log || "");
+-    const pre = this.querySelector("pre");
+-    if (pre && pre.textContent !== txt){
++
++    if (txt !== this._lastTxt){
+       pre.textContent = txt;
+-      pre.scrollTop = pre.scrollHeight;
++      this._lastTxt = txt;
++      if (this.follow) pre.scrollTop = pre.scrollHeight;
+     }
+   }
+ 
+   render(){
+-    this.innerHTML = `<pre class="log">Loading…</pre>`;
++    this.innerHTML = `
++      <div class="logbar">
++        <div class="muted" data-status style="font-size:12px;">Loading…</div>
++        <button class="btn" data-follow type="button">Follow: On</button>
++      </div>
++      <pre class="log" tabindex="0" aria-label="Job logs">Loading…</pre>
++    `;
+   }
+ }
+--- a/ui/components/mode-switch.mjs
++++ b/ui/components/mode-switch.mjs
+@@ -6,10 +6,10 @@
+   render(){
+     const mode = document.documentElement.classList.contains("mode-lab") ? "lab" : "suite";
+     this.innerHTML = `
+-      <div class="row" style="gap:8px;">
++      <div class="row gap-8" role="group" aria-label="Mode switch">
+         <span class="muted" style="font-size:12px;">Mode</span>
+-        <button class="btn ${mode === "suite" ? "primary" : ""}" data-mode="suite" title="Suite mode (light)">Suite</button>
+-        <button class="btn ${mode === "lab" ? "primary" : ""}" data-mode="lab" title="Lab mode (dark)">Lab</button>
++        <button class="btn ${mode === "suite" ? "primary" : ""}" data-mode="suite" aria-pressed="${mode === "suite"}" title="Suite mode (light)">Suite</button>
++        <button class="btn ${mode === "lab" ? "primary" : ""}" data-mode="lab" aria-pressed="${mode === "lab"}" title="Lab mode (dark)">Lab</button>
+       </div>
+     `;
+ 
+--- /dev/null
++++ b/ui/components/toast-host.mjs
+@@ -0,0 +1,35 @@
++export class ToastHost extends HTMLElement {
++  connectedCallback(){
++    this.innerHTML = `<div class="toastHost" aria-live="polite" aria-relevant="additions"></div>`;
++    this._mount = this.querySelector(".toastHost");
++    this._onToast = (e) => this._push(e.detail);
++    window.addEventListener("scoredock:toast", this._onToast);
++  }
++
++  disconnectedCallback(){
++    window.removeEventListener("scoredock:toast", this._onToast);
++  }
++
++  _push({ type, message, timeoutMs }){
++    if (!this._mount) return;
++
++    const el = document.createElement("div");
++    el.className = `toast ${type || "info"}`;
++    el.setAttribute("role", "status");
++    el.innerHTML = `
++      <div class="toastMsg"></div>
++      <button class="toastX" type="button" aria-label="Dismiss">×</button>
++    `;
++    el.querySelector(".toastMsg").textContent = message || "";
++    el.querySelector(".toastX").addEventListener("click", () => this._remove(el));
++    this._mount.appendChild(el);
++
++    window.setTimeout(() => this._remove(el), Number(timeoutMs) || 3200);
++  }
++
++  _remove(el){
++    if (!el || !el.isConnected) return;
++    el.classList.add("out");
++    window.setTimeout(() => { try{ el.remove(); }catch{} }, 180);
++  }
++}
+--- a/ui/index.html
++++ b/ui/index.html
+@@ -3,16 +3,17 @@
+   <head>
+     <meta charset="utf-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1" />
+-    <title>SPIN Evaluation Lab</title>
++    <title>ScoreDock</title>
+     <link rel="stylesheet" href="/styles.css" />
+   </head>
+   <body>
++    <a class="skiplink" href="#app">Skip to content</a>
+     <header class="topbar">
+       <div class="brand">
+         <div class="dot"></div>
+         <div>
+-          <div class="title">SPIN Evaluation Lab</div>
+-          <div class="subtitle">Deterministic benchmarking & promotion</div>
++          <div class="title">ScoreDock</div>
++          <div class="subtitle">Research-Grade Bench &amp; Tweak</div>
+         </div>
+       </div>
+ 
+@@ -23,6 +24,7 @@
+ 
+       <div class="right">
+         <mode-switch></mode-switch>
++        <density-switch></density-switch>
+       </div>
+     </header>
+ 
+@@ -35,6 +37,8 @@
+       <span class="muted">API: <code>/api/*</code></span>
+     </footer>
+ 
+-    <script type="module" src="/app.mjs"></script>
++    <toast-host></toast-host>
++
++    <script type="module" src="/app.mjs"></script
+   </body>
+ </html>
+--- a/ui/pages/lab-page.mjs
++++ b/ui/pages/lab-page.mjs
+@@ -5,7 +5,7 @@
+ export class LabPage extends HTMLElement {
+   constructor(){
+     super();
+-    this.state = { jobs: [], selectedJobId: null, autoRefresh: true };
++    this.state = { jobs: [], selectedJobId: null, autoRefresh: true, filters: { status: "", kind: "", q: "" }, notice: null };
+     this._timer = null;
+   }
+ 
+@@ -25,50 +25,103 @@
+     if (this._timer) window.clearInterval(this._timer);
+   }
+ 
++  handleShortcut(key){
++    if (key === "r"){ this.refresh(); return true; }
++    if (key === "j"){ this._navigate(1); return true; }
++    if (key === "k"){ this._navigate(-1); return true; }
++    if (key === "f"){
++      this.querySelector("#logViewer pre.log")?.focus();
++      return true;
++    }
++    return false;
++  }
++
++  _navigate(delta){
++    const table = this.querySelector("job-table");
++    const ids = (table && typeof table.getVisibleJobIds === "function") ? table.getVisibleJobIds() : [];
++    if (!ids.length) return;
++
++    let idx = ids.indexOf(this.state.selectedJobId);
++    if (idx < 0) idx = delta > 0 ? -1 : ids.length;
++    idx = Math.max(0, Math.min(ids.length - 1, idx + delta));
++
++    const nextId = ids[idx];
++    if (!nextId) return;
++
++    this.state.selectedJobId = nextId;
++    this.renderJobsOnly();
++    window.setTimeout(() => this.querySelector("job-table")?.focusRow?.(nextId), 0);
++  }
++
++  setNotice(type, message){
++    this.state.notice = message ? { type, message } : null;
++    const mount = this.querySelector("#statusArea");
++    if (!mount) return;
++    if (!this.state.notice){ mount.replaceChildren(); return; }
++    mount.innerHTML = `<div class="notice ${type}">${escapeHtml(message)}</div>`;
++  }
++
+   async refresh(){
+-    const jobs = await api.jobs().catch(() => ({ jobs: [] }));
+-    this.state.jobs = jobs.jobs || [];
+-    this.renderJobsOnly();
++    try{
++      const jobs = await api.jobs();
++      this.state.jobs = jobs.jobs || [];
++      this.renderJobsOnly();
++      if (this.state.notice?.type === "bad") this.setNotice(null, "");
++    }catch{
++      this.setNotice("warn", "Can't reach server right now. Showing last known jobs.");
++    }
+   }
+ 
+   render(){
+     this.innerHTML = `
+-      <div class="col" style="gap:12px;">
++      <div class="col gap-12">
+         <div class="card">
+-          <div class="row" style="justify-content:space-between;">
+-            <div>
++          <div class="card-header">
++            <div class="card-title">
+               <h1 class="h1">Lab</h1>
+               <div class="muted">Immutable benchmarking & audit. Inputs/outputs should live in <code>lab/</code>.</div>
+             </div>
+-            <div class="row">
+-              <label class="row" style="gap:8px;">
++
++            <div class="card-actions">
++              <label class="row gap-8">
+                 <input type="checkbox" id="autoRefresh" ${this.state.autoRefresh ? "checked": ""}/>
+                 <span class="muted" style="font-size:12px;">Auto refresh</span>
+               </label>
+               <button class="btn" id="refreshBtn">Refresh</button>
+             </div>
+           </div>
++
++          <div id="statusArea" class="mt-10" role="status" aria-live="polite"></div>
+         </div>
+ 
+         <div class="split">
+           <div class="card">
+-            <h2 class="h2">Jobs</h2>
+-            <div id="jobTable" style="margin-top:10px;"></div>
++            <div class="card-header">
++              <div class="card-title">
++                <h2 class="h2">Jobs</h2>
++                <div class="help">Artifacts are immutable; reruns create new folders. Shortcuts: <span class="kbd">J</span>/<span class="kbd">K</span>, <span class="kbd">F</span> logs.</div>
++              </div>
++            </div>
++            <div id="jobTable" class="mt-10"></div>
+           </div>
+ 
+           <div class="card">
+-            <h2 class="h2">Logs</h2>
+-            <div class="muted" style="margin-top:8px;">Select a job to view logs.</div>
+-            <div id="logViewer" style="margin-top:10px;"></div>
++            <div class="card-header">
++              <div class="card-title">
++                <h2 class="h2">Logs</h2>
++                <div class="help">Select a job to view logs. Follow will pause if you scroll up.</div>
++              </div>
++            </div>
++            <div id="logViewer" class="mt-10"></div>
+           </div>
+         </div>
+ 
+         <div class="card">
+           <h2 class="h2">Policy</h2>
+-          <div class="muted" style="margin-top:8px; line-height:1.55;">
++          <div class="muted mt-8" style="line-height:1.55;">
+             <div>• Promotion is the only path into lab.</div>
+             <div>• Release is the only path into public.</div>
+-            <div>• Artifacts are immutable; reruns create new folders.</div>
++            <div>• Artifacts are immutable; reruns create new folders. Shortcuts: <span class="kbd">J</span>/<span class="kbd">K</span>, <span class="kbd">F</span> logs.</div>
+           </div>
+         </div>
+       </div>
+@@ -91,9 +144,16 @@
+     const table = new JobTable({
+       jobs: this.state.jobs,
+       selectedId: this.state.selectedJobId,
++      filters: this.state.filters,
++      mode: "lab",
++      onFilterChange: (filters) => {
++        this.state.filters = filters;
++        this.renderJobsOnly();
++      },
+       onSelect: (id) => {
+         this.state.selectedJobId = id;
+         this.renderJobsOnly();
++        window.setTimeout(() => this.querySelector("job-table")?.focusRow?.(id), 0);
+       }
+     });
+     mount.appendChild(table);
+@@ -102,3 +162,12 @@
+     logMount.appendChild(new LogViewer({ jobId: this.state.selectedJobId }));
+   }
+ }
++
++function escapeHtml(s){
++  return String(s ?? "")
++    .replaceAll("&", "&amp;")
++    .replaceAll("<", "&lt;")
++    .replaceAll(">", "&gt;")
++    .replaceAll('"', "&quot;")
++    .replaceAll("'", "&#039;");
++}
+--- a/ui/pages/suite-page.mjs
++++ b/ui/pages/suite-page.mjs
+@@ -1,4 +1,5 @@
+ import { api } from "../shared/api.mjs";
++import { toast } from "../shared/toast.mjs";
+ import { JobTable } from "../components/job-table.mjs";
+ import { LogViewer } from "../components/log-viewer.mjs";
+ import { PromoteWizard } from "../components/promote-wizard.mjs";
+@@ -10,18 +11,23 @@
+       jobs: [],
+       selectedJobId: null,
+       autoRefresh: true,
++      filters: { status: "", kind: "", q: "" },
++
+       artifactPath: "private/_inbox/artifact.json",
+       outDir: "private/runs",
+       minutes: 10,
+-      runs: [],
+-      candidate: null,
++
++      busy: false,
++      notice: null, // { type: "good"|"bad"|"warn", message: string }
+     };
++
+     this._timer = null;
+   }
+ 
+   connectedCallback(){
+     this.render();
+     this.refresh();
++
+     this._timer = window.setInterval(() => {
+       if (this.state.autoRefresh) this.refresh();
+     }, 1200);
+@@ -31,71 +37,159 @@
+     if (this._timer) window.clearInterval(this._timer);
+   }
+ 
++  handleShortcut(key){
++    if (key === "r"){ this.refresh(); return true; }
++    if (key === "j"){ this._navigate(1); return true; }
++    if (key === "k"){ this._navigate(-1); return true; }
++    if (key === "f"){
++      // Focus logs panel (pre is tabindex=0)
++      this.querySelector("#logViewer pre.log")?.focus();
++      return true;
++    }
++    return false;
++  }
++
++  _navigate(delta){
++    const table = this.querySelector("job-table");
++    const ids = (table && typeof table.getVisibleJobIds === "function") ? table.getVisibleJobIds() : [];
++    if (!ids.length) return;
++
++    let idx = ids.indexOf(this.state.selectedJobId);
++    if (idx < 0) idx = delta > 0 ? -1 : ids.length;
++    idx = Math.max(0, Math.min(ids.length - 1, idx + delta));
++
++    const nextId = ids[idx];
++    if (!nextId) return;
++
++    this.state.selectedJobId = nextId;
++    this.renderJobsOnly();
++    window.setTimeout(() => this.querySelector("job-table")?.focusRow?.(nextId), 0);
++  }
++
++  setNotice(type, message){
++    this.state.notice = message ? { type, message } : null;
++    const mount = this.querySelector("#statusArea");
++    if (!mount) return;
++
++    if (!this.state.notice){
++      mount.replaceChildren();
++      return;
++    }
++
++    mount.innerHTML = `<div class="notice ${type}">${escapeHtml(message)}</div>`;
++  }
++
++  setBusy(b){
++    this.state.busy = !!b;
++    this.querySelector("#benchBtn")?.toggleAttribute("disabled", this.state.busy);
++    this.querySelector("#tweakBtn")?.toggleAttribute("disabled", this.state.busy);
++    this.querySelector("#refreshBtn")?.toggleAttribute("disabled", this.state.busy);
++    this.toggleAttribute("aria-busy", this.state.busy);
++  }
++
+   async refresh(){
+-    const jobs = await api.jobs().catch(() => ({ jobs: [] }));
+-    this.state.jobs = jobs.jobs || [];
+-    this.renderJobsOnly();
++    try{
++      const jobs = await api.jobs();
++      this.state.jobs = jobs.jobs || [];
++      this.renderJobsOnly();
++      // don't overwrite a current notice unless it's an error
++      if (this.state.notice?.type === "bad") this.setNotice(null, "");
++    }catch(err){
++      this.setNotice("warn", `Can't reach server right now. Showing last known jobs.`);
++    }
+   }
+ 
+   render(){
+     this.innerHTML = `
+-      <div class="col" style="gap:12px;">
++      <div class="col gap-12">
+         <div class="card">
+-          <div class="row" style="justify-content:space-between;">
+-            <div>
++          <div class="card-header">
++            <div class="card-title">
+               <h1 class="h1">Suite</h1>
+               <div class="muted">Iterate, tweak, pick candidates. Outputs must stay in <code>private/</code>.</div>
+             </div>
+-            <div class="row">
+-              <label class="row" style="gap:8px;">
++
++            <div class="card-actions">
++              <label class="row gap-8">
+                 <input type="checkbox" id="autoRefresh" ${this.state.autoRefresh ? "checked": ""}/>
+                 <span class="muted" style="font-size:12px;">Auto refresh</span>
+               </label>
+               <button class="btn" id="refreshBtn">Refresh <span class="kbd">R</span></button>
+             </div>
+           </div>
++
++          <div id="statusArea" class="mt-10" role="status" aria-live="polite"></div>
+         </div>
+ 
+         <div class="split">
+-          <div class="col" style="gap:12px;">
++          <div class="col gap-12">
+             <div class="card">
+               <h2 class="h2">Runner controls</h2>
+-              <div class="row" style="margin-top:10px;">
+-                <input class="input" id="artifactPath" placeholder="artifactPath" value="${escapeHtml(this.state.artifactPath)}"/>
+-                <input class="input" id="outDir" placeholder="outDir" value="${escapeHtml(this.state.outDir)}"/>
+-              </div>
+-              <div class="row">
++
++              <div class="row wrap gap-12 mt-10">
++                <div class="field" style="flex:1;">
++                  <div class="label">Artifact path</div>
++                  <input class="input" id="artifactPath" placeholder="private/_inbox/artifact.json" value="${escapeHtml(this.state.artifactPath)}"/>
++                  <div class="help">Input must remain under <code>private/</code> in Suite.</div>
++                </div>
++
++                <div class="field" style="flex:1;">
++                  <div class="label">Output directory</div>
++                  <input class="input" id="outDir" placeholder="private/runs" value="${escapeHtml(this.state.outDir)}"/>
++                  <div class="help">Bench writes new runs here.</div>
++                </div>
++              </div>
++
++              <div class="row wrap gap-12 mt-10">
+                 <button class="btn primary" id="benchBtn">Start bench</button>
+-                <div class="row">
+-                  <input class="input" style="width:130px" id="minutes" type="number" min="1" value="${this.state.minutes}"/>
++
++                <div class="row gap-10 wrap">
++                  <div class="field" style="min-width:140px;">
++                    <div class="label">Tweak minutes</div>
++                    <input class="input" id="minutes" type="number" min="1" value="${this.state.minutes}" style="width:140px"/>
++                  </div>
+                   <button class="btn" id="tweakBtn">Start tweak</button>
+                 </div>
+-                <span class="muted" style="font-size:12px;">Requires server: <code>node runner/server.mjs</code></span>
+-              </div>
+-            </div>
+-
+-            <div class="card">
+-              <h2 class="h2">Jobs</h2>
+-              <div id="jobTable" style="margin-top:10px;"></div>
+-            </div>
+-
+-            <div class="card">
+-              <h2 class="h2">Promotion</h2>
+-              <div class="muted" style="margin-top:8px;">Promotion is explicit: private_dev → internal_benchmark (writes into <code>lab/</code>).</div>
+-              <div id="promoteWizard" style="margin-top:10px;"></div>
++
++                <span class="help">Requires server: <code>node runner/server.mjs</code></span>
++              </div>
++            </div>
++
++            <div class="card">
++              <div class="card-header">
++                <div class="card-title">
++                  <h2 class="h2">Jobs</h2>
++                  <div class="help">Tip: <span class="kbd">J</span>/<span class="kbd">K</span> navigate, <span class="kbd">Enter</span>/<span class="kbd">Space</span> select, <span class="kbd">F</span> focuses logs.</div>
++                </div>
++              </div>
++              <div id="jobTable" class="mt-10"></div>
++            </div>
++
++            <div class="card">
++              <div class="card-header">
++                <div class="card-title">
++                  <h2 class="h2">Promotion</h2>
++                  <div class="help">Promotion is explicit: private_dev → internal_benchmark (writes into <code>lab/</code>).</div>
++                </div>
++              </div>
++              <div id="promoteWizard" class="mt-10"></div>
+             </div>
+           </div>
+ 
+-          <div class="col" style="gap:12px;">
+-            <div class="card">
+-              <h2 class="h2">Logs</h2>
+-              <div class="muted" style="margin-top:8px;">Select a job to view logs.</div>
+-              <div id="logViewer" style="margin-top:10px;"></div>
++          <div class="col gap-12">
++            <div class="card">
++              <div class="card-header">
++                <div class="card-title">
++                  <h2 class="h2">Logs</h2>
++                  <div class="help">Select a job to view logs. Follow will pause if you scroll up.</div>
++                </div>
++              </div>
++              <div id="logViewer" class="mt-10"></div>
+             </div>
+ 
+             <div class="card">
+               <h2 class="h2">Notes</h2>
+-              <div class="muted" style="margin-top:8px; line-height:1.55;">
++              <div class="muted mt-8" style="line-height:1.55;">
+                 <div>• Suite mode defaults to <b>light</b> theme.</div>
+                 <div>• Auto-tweak is suite-only.</div>
+                 <div>• Public exports are blocked from private inputs.</div>
+@@ -112,24 +206,44 @@
+ 
+     this.querySelector("#refreshBtn")?.addEventListener("click", () => this.refresh());
+ 
+-    window.addEventListener("keydown", (e) => {
+-      if ((e.key || "").toLowerCase() === "r") this.refresh();
+-    }, { passive: true });
+-
+     this.querySelector("#benchBtn")?.addEventListener("click", async () => {
+       this.readInputs();
+-      const r = await api.bench({ artifactPath: this.state.artifactPath, outDir: this.state.outDir }).catch(err => ({ error: String(err) }));
+-      if (r.jobId) this.state.selectedJobId = r.jobId;
+-      this.refresh();
+-      this.renderJobsOnly();
++      this.setBusy(true);
++      this.setNotice("warn", "Starting bench…");
++      toast("warn", "Starting bench…");
++      try{
++        const r = await api.bench({ artifactPath: this.state.artifactPath, outDir: this.state.outDir });
++        if (r.jobId) this.state.selectedJobId = r.jobId;
++        this.setNotice("good", `Bench started (${r.jobId}).`);
++        toast("good", `Bench started (${r.jobId}).`);
++      }catch(err){
++        this.setNotice("bad", `Bench failed: ${String(err?.message || err)}`);
++        toast("bad", `Bench failed: ${String(err?.message || err)}`);
++      }finally{
++        this.setBusy(false);
++        this.refresh();
++        this.renderJobsOnly();
++      }
+     });
+ 
+     this.querySelector("#tweakBtn")?.addEventListener("click", async () => {
+       this.readInputs();
+-      const r = await api.tweak({ artifactPath: this.state.artifactPath, minutes: Number(this.state.minutes) || 10 }).catch(err => ({ error: String(err) }));
+-      if (r.jobId) this.state.selectedJobId = r.jobId;
+-      this.refresh();
+-      this.renderJobsOnly();
++      this.setBusy(true);
++      this.setNotice("warn", "Starting tweak…");
++      toast("warn", "Starting tweak…");
++      try{
++        const r = await api.tweak({ artifactPath: this.state.artifactPath, minutes: Number(this.state.minutes) || 10 });
++        if (r.jobId) this.state.selectedJobId = r.jobId;
++        this.setNotice("good", `Tweak started (${r.jobId}).`);
++        toast("good", `Tweak started (${r.jobId}).`);
++      }catch(err){
++        this.setNotice("bad", `Tweak failed: ${String(err?.message || err)}`);
++        toast("bad", `Tweak failed: ${String(err?.message || err)}`);
++      }finally{
++        this.setBusy(false);
++        this.refresh();
++        this.renderJobsOnly();
++      }
+     });
+ 
+     // initial sub-components
+@@ -154,9 +268,17 @@
+     const table = new JobTable({
+       jobs: this.state.jobs,
+       selectedId: this.state.selectedJobId,
++      filters: this.state.filters,
++      mode: "suite",
++      onFilterChange: (filters) => {
++        this.state.filters = filters;
++        this.renderJobsOnly();
++      },
+       onSelect: (id) => {
+         this.state.selectedJobId = id;
+         this.renderJobsOnly();
++        // keep selection feeling snappy for keyboard users
++        window.setTimeout(() => this.querySelector("job-table")?.focusRow?.(id), 0);
+       }
+     });
+     mount.appendChild(table);
+--- /dev/null
++++ b/ui/shared/toast.mjs
+@@ -0,0 +1,10 @@
++export function toast(type, message, opts){
++  const t = (typeof type === "string" && message == null) ? "info" : String(type || "info");
++  const msg = (message == null) ? String(type || "") : String(message || "");
++  const detail = {
++    type: (t === "good" || t === "bad" || t === "warn" || t === "info") ? t : "info",
++    message: msg,
++    timeoutMs: Number(opts?.timeoutMs) || 3200,
++  };
++  window.dispatchEvent(new CustomEvent("scoredock:toast", { detail }));
++}
+--- a/ui/styles.css
++++ b/ui/styles.css
+@@ -1,4 +1,4 @@
+-/* SPIN Evaluation Lab — zero-dep UI
++/* ScoreDock — zero-dep UI
+    Theme controlled ONLY via <html class="mode-suite|mode-lab">.
+ */
+ 
+@@ -197,3 +197,184 @@
+   white-space: pre-wrap;
+   word-break: break-word;
+ }
++
++/* --- UI polish additions (zero-dep) --- */
++
++/* Accessible focus rings */
++:where(a, button, input, select, textarea, [tabindex]):focus-visible{
++  outline: 3px solid color-mix(in srgb, var(--accent) 55%, transparent);
++  outline-offset: 2px;
++  border-radius: 12px;
++}
++
++/* Make links look like links (inherit still OK for nav) */
++a.link{ color: var(--accent); text-decoration: none; }
++a.link:hover{ text-decoration: underline; }
++
++/* Utilities: spacing + alignment */
++.gap-6{ gap:6px; } .gap-8{ gap:8px; } .gap-10{ gap:10px; } .gap-12{ gap:12px; } .gap-16{ gap:16px; }
++.mt-6{ margin-top:6px; } .mt-8{ margin-top:8px; } .mt-10{ margin-top:10px; } .mt-12{ margin-top:12px; }
++.jc-between{ justify-content: space-between; } .ai-start{ align-items:flex-start; } .wrap{ flex-wrap: wrap; }
++
++/* Card header pattern */
++.card-header{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
++.card-title{ display:flex; flex-direction:column; gap:4px; }
++.card-actions{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
++
++/* Form field pattern */
++.field{ display:flex; flex-direction:column; gap:6px; min-width: 220px; }
++.label{ font-size:12px; color: var(--muted); }
++.help{ font-size:12px; color: color-mix(in srgb, var(--muted) 85%, transparent); line-height:1.4; }
++
++/* Notice / status */
++.notice{
++  padding: 10px 12px;
++  border-radius: 12px;
++  border: 1px solid var(--border);
++  background: color-mix(in srgb, var(--panel) 85%, transparent);
++  font-size: 13px;
++}
++.notice.good{ border-color: color-mix(in srgb, var(--good) 45%, var(--border)); }
++.notice.bad{ border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
++.notice.warn{ border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
++
++/* Buttons */
++.btn:disabled{ opacity: .55; cursor: not-allowed; }
++
++/* Link-like button for table rows etc */
++.linklike{
++  appearance:none;
++  background: transparent;
++  border: none;
++  padding: 0;
++  color: var(--accent);
++  cursor: pointer;
++  font: inherit;
++}
++.linklike:hover{ text-decoration: underline; }
++
++/* Table row affordances */
++.table tbody tr[data-job]{ cursor: pointer; }
++.table tbody tr[data-job]:hover{ background: color-mix(in srgb, var(--accent) 6%, transparent); }
++.table tr[aria-selected="true"]{
++  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
++  outline-offset: -2px;
++  background: color-mix(in srgb, var(--accent) 8%, transparent);
++}
++
++/* Skip link */
++.skiplink{
++  position: absolute;
++  left: 12px;
++  top: 10px;
++  padding: 8px 10px;
++  border-radius: 12px;
++  border: 1px solid var(--border);
++  background: var(--panel);
++  color: var(--fg);
++  transform: translateY(-140%);
++  transition: transform 140ms ease;
++  z-index: 999;
++}
++.skiplink:focus{ transform: translateY(0); }
++
++/* Log viewer header */
++.logbar{
++  display:flex;
++  align-items:center;
++  justify-content:space-between;
++  gap:10px;
++  margin-bottom: 8px;
++}
++
++.jobid code{ color: var(--accent); }
++
++
++/* Header right side */
++.right{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
++
++/* Table filter bar */
++.tablebar{
++  margin-bottom: 10px;
++  padding: 10px 12px;
++  border-radius: 14px;
++  border: 1px solid var(--border);
++  background: color-mix(in srgb, var(--panel) 82%, transparent);
++}
++.field-inline{ min-width: 140px; }
++.select{ padding-right: 28px; }
++
++/* Empty states */
++.empty{
++  padding: 10px 4px;
++}
++.empty-title{
++  font-weight: 700;
++  margin-bottom: 6px;
++}
++.empty-body{
++  color: var(--muted);
++  font-size: 13px;
++  line-height: 1.5;
++}
++.empty-steps{
++  margin-top: 8px;
++  display:flex;
++  flex-direction:column;
++  gap:6px;
++  font-size: 12px;
++  color: color-mix(in srgb, var(--muted) 90%, transparent);
++}
++
++/* Toasts */
++.toastHost{
++  position: fixed;
++  right: 14px;
++  bottom: 14px;
++  z-index: 9999;
++  display:flex;
++  flex-direction:column;
++  gap:10px;
++  width: min(360px, calc(100vw - 28px));
++}
++.toast{
++  border: 1px solid var(--border);
++  background: color-mix(in srgb, var(--panel) 92%, transparent);
++  border-radius: 14px;
++  padding: 10px 12px;
++  display:flex;
++  align-items:flex-start;
++  justify-content:space-between;
++  gap:10px;
++  box-shadow: 0 12px 26px rgba(0,0,0,0.18);
++  transform: translateY(0);
++  opacity: 1;
++  transition: transform 180ms ease, opacity 180ms ease;
++}
++.toast.out{
++  transform: translateY(8px);
++  opacity: 0;
++}
++.toast.good{ border-color: color-mix(in srgb, var(--good) 45%, var(--border)); }
++.toast.bad{ border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
++.toast.warn{ border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
++.toastMsg{ font-size: 13px; line-height: 1.35; }
++.toastX{
++  appearance:none;
++  border: 1px solid var(--border);
++  background: transparent;
++  color: var(--muted);
++  width: 26px;
++  height: 26px;
++  border-radius: 10px;
++  cursor:pointer;
++}
++.toastX:hover{ color: var(--fg); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
++
++/* Density */
++html.density-compact .table{ font-size: 12px; }
++html.density-compact .table th, 
++html.density-compact .table td{ padding: 7px 6px; }
++html.density-compact pre.log{ padding: 10px; font-size: 11px; max-height: 360px; }
++html.density-compact .btn{ padding: 8px 10px; }
++html.density-compact .input{ padding: 8px 9px; }
